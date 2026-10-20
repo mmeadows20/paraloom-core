@@ -24,6 +24,7 @@ use crate::network::{
     SettlementKind,
 };
 use crate::privacy::pool::ShieldedPool;
+use crate::privacy::types::{Commitment, NATIVE_SOL_ASSET};
 use crate::resource::ResourceMonitor;
 use crate::storage::{ComputeStorage, PrivacyStorage};
 use crate::types::{NodeId, NodeInfo, NodeStatus, NodeType};
@@ -2689,8 +2690,15 @@ impl Node {
             // node's `check_batch` pre-filters replays before consensus,
             // matching the on-chain nullifier PDAs that are the authoritative
             // double-spend gate (#624).
+            //
+            // The same settlement also minted the request's output notes and,
+            // for a withdrawal, paid `|ext_amount|` out of the asset's vault,
+            // so the pool's tree and supply follow the chain too (#1136).
+            // Without that, `path` returns nothing for a note a client was
+            // just paid and the tracked supply keeps counting withdrawn value.
             if let Some(pool) = &self.shielded_pool {
                 pool.record_spent(approved.request.nullifiers).await;
+                self.mirror_settled_transact(pool, &approved.request).await;
             }
         }
 

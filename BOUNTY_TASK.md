@@ -1,72 +1,63 @@
-# Bounty Objective: [BOUNTY] High: Unsegregated fee accounting in bridge_vault allows user withdrawals to drain validator rewards and permanently deadlock unbonding stake exit
-Target: paraloom-labs/paraloom-core Issue #1138
-URL: https://github.com/paraloom-labs/paraloom-core/issues/1138
+# Bounty Objective: [BOUNTY] Medium: ShieldedPool supply monotonically inflates and             commitment tree desynchronizes due to missing output commitments and          balance debit in settle_transact_via_cosign
+Target: paraloom-labs/paraloom-core Issue #1136
+URL: https://github.com/paraloom-labs/paraloom-core/issues/1136
 
 ## Issue Description
-### Summary
-- **Severity:** High ($400 USDC — Stage 1 On-Chain Bridge & Staking Invariant)
-- **Affected Files:** `programs/paraloom/src/lib.rs` (lines 440–474 in `transact`, lines 1007–1050 in `claim_rewards`, lines 1673–1746 in `withdraw_unbonded_stake`)
-- **Payout Address:** `3HLDkipdKmJKGjbgCD8moo3GyhEY4DWdZ7JAgSpMysHp`
-
----
-
-### Vulnerability Details
-
-#### 1. The Vulnerability Mechanism
-In `programs/paraloom/src/lib.rs`, when a validator settles a native SOL withdrawal via `transact` (lines 425–466), external funds are moved out of `bridge_vault`:
-```rust
-let payout = gross - fee;
-let vault_balance = ctx.accounts.bridge_vault.lamports();
-let rent_floor = Rent::get()?.minimum_balance(0);
-require!(
-    vault_balance >= payout.saturating_add(rent_floor),
-    BridgeError::InsufficientFunds
-);
-// payout transferred to recipient
-validator_account.pending_rewards = validator_account
-    .pending_rewards
-    .checked_add(fee)
-    .ok_or(BridgeError::InvalidAmount)?;
-```
-Notice that:
-1. `fee` is credited to `validator_account.pending_rewards`, but the corresponding lamports are **never segregated into a dedicated rewards vault or transferred inline**; they remain co-mingled in the shared `bridge_vault`.
-2. On every subsequent withdrawal (`transact`, line 444), the solvency check only verifies that `vault_balance >= payout.saturating_add(rent_floor)`. It **does not reserve accrued validator pending rewards**. As a result, subsequent user withdrawals can completely drain the lamports representing validators' accumulated fees.
-
-#### 2. The Exit Deadlock (Permanent Capital Lock)
-When a validator unregisters and waits out `UNBONDING_SLOTS`, its exit instruction is `withdraw_unbonded_stake` (lines 1673–1746).
-Line 1694 strictly enforces:
-```rust
-require!(
-    validator_account.pending_rewards == 0,
-    BridgeError::PendingRewardsUnclaimed
-);
-```
-To satisfy this constraint, the validator is forced to call `claim_rewards` (lines 1007–1050) first.
-However, `claim_rewards` attempts to transfer `reward_amount` directly from `bridge_vault` (lines 1024–1034). If user withdrawals have drained `bridge_vault` below `reward_amount + rent_floor`:
-- `claim_rewards` fails with runtime `InsufficientFunds` / `InsufficientFundsForRent`.
-- `validator_account.pending_rewards` remains `> 0`.
-- `withdraw_unbonded_stake` is permanently blocked (`PendingRewardsUnclaimed`).
-- Anchor's `close = validator` constraint is never reached.
-
-**Consequence:** The validator's entire native SOL stake (`unbonding_amount` >= 100 SOL) and dual-stake SPL collateral (`token_unbonding_amount`) become **permanently frozen inside the contract with zero operational recourse**.
-
----
-
-### Minimal Fix
-1. In `BridgeState`, maintain `total_pending_rewards: u64`, incremented on `transact` fees and decremented on `claim_rewards`.
-2. In `transact` (line 444), ensure user withdrawals cannot consume accrued validator fees:
-```diff
-- require!(
--     vault_balance >= payout.saturating_add(rent_floor),
--     BridgeError::InsufficientFunds
-- );
-+ require!(
-+     vault_balance >= payout.saturating_add(rent_floor).saturating_add(bridge_state.total_pending_rewards),
-+     BridgeError::InsufficientFunds
-+ );
-```
-3. In `claim_rewards` (lines 1013–1020), add an explicit rent floor check before CPI transfer.
-
+**Describe the bug**                                                     
+    In `src/node/mod.rs:2539-2547` (`settle_transact_via_cosign`), when a    
+  transact settlement confirms on-chain (`if settled`), the node only invokes
+  `pool.record_spent(approved.request.nullifiers)`.                          
+                                                                             
+    It completely omits updating the local `ShieldedPool` state for the newly
+  created output notes and external withdrawals:                             
+    1. `approved.request.output_commitments` are never added to `self.       
+  commitment_tree`.                                                          
+    2. When a withdrawal occurs (`approved.request.ext_amount < 0`), `self.  
+  supplies` is never debited for the external payout amount.                 
+                                                                             
+    Impact:                                                                  
+    - The node's commitment tree permanently desynchronizes from the on-chain
+  Merkle tree. Subsequent attempts by clients to fetch witness paths for     
+  newly created output notes via `pool.path(&commitment)` fail with          
+  `CommitmentNotFound`.                                                      
+    - The off-chain tracked shielded supply (`pool.supply_of(...)` / `pool.  
+  total_supply()`) monotonically diverges from the on-chain vault balance    
+  upon every withdrawal, permanently violating accounting invariants and     
+  breaking `verify_consistency()`.                                           
+                                                                             
+    **To Reproduce**                                                         
+    Steps to reproduce the behavior:                                         
+    1. Start a Paraloom node with an active `ShieldedPool`.                  
+    2. Submit and co-sign an `ApprovedTransact` containing a valid withdrawal
+  (`ext_amount = -1_000_000_000` lamports) and two output commitments `[c0,  
+  c1]`.                                                                      
+    3. Wait for `settle_transact_via_cosign` to complete successfully on-    
+  chain (`settled == true`).                                                 
+    4. Inspect `pool.commitment_count()` and `pool.                          
+  supply_of(NATIVE_SOL_ASSET)`:                                              
+       - Notice output commitments `c0` and `c1` are missing from the tree   
+  (`pool.path(&c0)` returns `CommitmentNotFound`).                           
+       - Notice `pool.supply_of(NATIVE_SOL_ASSET)` was never decremented by 1
+  SOL, retaining the pre-transact supply despite funds leaving the on-chain  
+  vault.                                                                     
+                                                                             
+    **Expected behavior**                                                    
+    When `settled == true` in `settle_transact_via_cosign`:                  
+    1. `pool` should record the newly minted `output_commitments` into `self.
+  commitment_tree`.                                                          
+    2. If `approved.request.ext_amount < 0`, `pool.supplies` must be         
+  decremented by `approved.request.ext_amount.unsigned_abs()` for the        
+  corresponding asset (SOL or SPL mint).                                     
+                                                                             
+    **Environment (please complete the following information):**             
+     - OS: Ubuntu 22.04 LTS / macOS 15.0                                     
+     - Rust Version: 1.85.0+                                                 
+     - Paraloom Version: 0.6.0 (commit `9e8c8e6`)                            
+                                                                             
+    **Additional context**                                                   
+    - Affected code: `src/node/mod.rs:2539-2547`                             
+    - Bug Bounty Payout Wallet (Base USDC):                                  
+  `0xbd42ca36676550e489d746607cb030422a153eb6`
 
 ## Instructions for Kuro (Autonomous Solver):
 1. Use skills: `systematic-debugging` and `code-review-and-quality`.
