@@ -1,25 +1,72 @@
-# Bounty Objective: [BOUNTY] Medium: Discovery wallet claim needs no proof of ownership — impersonating any registered validator burns the per-nullifier co-sign budget and freezes a targeted settlement
-Target: paraloom-labs/paraloom-core Issue #1145
-URL: https://github.com/paraloom-labs/paraloom-core/issues/1145
+# Bounty Objective: [BOUNTY] High: Unsegregated fee accounting in bridge_vault allows user withdrawals to drain validator rewards and permanently deadlock unbonding stake exit
+Target: paraloom-labs/paraloom-core Issue #1138
+URL: https://github.com/paraloom-labs/paraloom-core/issues/1138
 
 ## Issue Description
-**Component:** `src/node/` (Discovery handling, co-sign ingress) + `src/consensus/transact.rs` (validator registration/admission). In scope (Stage 1: `src/consensus/`, settlement/co-sign path of `src/node/`). Checked `docs/security-log.md` — not listed (this is the residual gap of the #627 fix: registration now checks the claimed wallet is in the on-chain set, but never that the claimant owns it).
+### Summary
+- **Severity:** High ($400 USDC — Stage 1 On-Chain Bridge & Staking Invariant)
+- **Affected Files:** `programs/paraloom/src/lib.rs` (lines 440–474 in `transact`, lines 1007–1050 in `claim_rewards`, lines 1673–1746 in `withdraw_unbonded_stake`)
+- **Payout Address:** `3HLDkipdKmJKGjbgCD8moo3GyhEY4DWdZ7JAgSpMysHp`
 
-**Summary:** When a peer sends `Message::Discovery`, a node registers `node_info.wallet_pubkey` — a self-asserted string — via `register_validator_with_wallet` with no signature challenge or any other proof that the peer controls that Solana wallet. Admission (`src/consensus/transact.rs`) only checks the claimed wallet is in the on-chain validator set. All downstream authorization (`source_is_onchain_validator`, gating `handle_cosign_request` and verification requests) trusts this NodeId→wallet mapping.
+---
 
-**Attack:**
-1. Join the mesh with any libp2p key; send Discovery claiming `node_type = ResourceProvider` and `wallet_pubkey` = a real registered validator's wallet. Every honest node now treats you as that validator. No stake, no wallet key needed.
-2. Copy a victim settlement's public parameters from gossip (recipient, nullifiers, output commitments, root, ext_amount, mint).
-3. Send each honest validator 4 crafted co-sign requests matching its `verified_transacts` cache (the proof bytes are not compared). Each accepted request increments the per-`(nullifier, authority)` counter; at `MAX_COSIGNS_PER_SETTLEMENT = 4` the budget for both input nullifiers is exhausted.
-4. When the legitimate leader runs the real co-sign round, every burned validator declines ("co-sign count limit reached"), `gather_signatures` never reaches threshold, and settlement fails after all retries. The counters are keyed by nullifier (not request id), never decrease, and have no TTL — re-proving with a fresh canonical id does not help. In a 2-of-2 validator set, burning the single co-signer fully freezes that spend.
+### Vulnerability Details
 
-**Impact:** An unprivileged network peer with no stake and no keys can indefinitely halt a targeted, already-quorum-approved settlement on every validator it can reach — a griefing/liveness halt of settlement (Medium), defeating the gate that was added to prevent exactly this class of abuse.
+#### 1. The Vulnerability Mechanism
+In `programs/paraloom/src/lib.rs`, when a validator settles a native SOL withdrawal via `transact` (lines 425–466), external funds are moved out of `bridge_vault`:
+```rust
+let payout = gross - fee;
+let vault_balance = ctx.accounts.bridge_vault.lamports();
+let rent_floor = Rent::get()?.minimum_balance(0);
+require!(
+    vault_balance >= payout.saturating_add(rent_floor),
+    BridgeError::InsufficientFunds
+);
+// payout transferred to recipient
+validator_account.pending_rewards = validator_account
+    .pending_rewards
+    .checked_add(fee)
+    .ok_or(BridgeError::InvalidAmount)?;
+```
+Notice that:
+1. `fee` is credited to `validator_account.pending_rewards`, but the corresponding lamports are **never segregated into a dedicated rewards vault or transferred inline**; they remain co-mingled in the shared `bridge_vault`.
+2. On every subsequent withdrawal (`transact`, line 444), the solvency check only verifies that `vault_balance >= payout.saturating_add(rent_floor)`. It **does not reserve accrued validator pending rewards**. As a result, subsequent user withdrawals can completely drain the lamports representing validators' accumulated fees.
 
-**Note:** the counts map is size-bounded with arbitrary eviction (#626), so the freeze lasts until node restart or until the entries happen to be evicted under map pressure; on a quiet devnet node neither occurs in practice, and the budget can be re-burned at negligible cost.
+#### 2. The Exit Deadlock (Permanent Capital Lock)
+When a validator unregisters and waits out `UNBONDING_SLOTS`, its exit instruction is `withdraw_unbonded_stake` (lines 1673–1746).
+Line 1694 strictly enforces:
+```rust
+require!(
+    validator_account.pending_rewards == 0,
+    BridgeError::PendingRewardsUnclaimed
+);
+```
+To satisfy this constraint, the validator is forced to call `claim_rewards` (lines 1007–1050) first.
+However, `claim_rewards` attempts to transfer `reward_amount` directly from `bridge_vault` (lines 1024–1034). If user withdrawals have drained `bridge_vault` below `reward_amount + rent_floor`:
+- `claim_rewards` fails with runtime `InsufficientFunds` / `InsufficientFundsForRent`.
+- `validator_account.pending_rewards` remains `> 0`.
+- `withdraw_unbonded_stake` is permanently blocked (`PendingRewardsUnclaimed`).
+- Anchor's `close = validator` constraint is never reached.
 
-**Suggested fix:** Require proof of wallet ownership at Discovery registration (e.g. a signature over `domain || NodeId || timestamp` verified at registration — the vote-signing primitives can be reused), or admit a NodeId as a validator only after it has produced a valid vote signed by the claimed wallet.
+**Consequence:** The validator's entire native SOL stake (`unbonding_amount` >= 100 SOL) and dual-stake SPL collateral (`token_unbonding_amount`) become **permanently frozen inside the contract with zero operational recourse**.
 
-Reporter: zc_whitehat, contact digdcc@gmail.com. Payout (USDC, Solana): 8B73vBdUqXofypTpgGgJc85WCvvTFwWDqMtrsXaxVqem
+---
+
+### Minimal Fix
+1. In `BridgeState`, maintain `total_pending_rewards: u64`, incremented on `transact` fees and decremented on `claim_rewards`.
+2. In `transact` (line 444), ensure user withdrawals cannot consume accrued validator fees:
+```diff
+- require!(
+-     vault_balance >= payout.saturating_add(rent_floor),
+-     BridgeError::InsufficientFunds
+- );
++ require!(
++     vault_balance >= payout.saturating_add(rent_floor).saturating_add(bridge_state.total_pending_rewards),
++     BridgeError::InsufficientFunds
++ );
+```
+3. In `claim_rewards` (lines 1013–1020), add an explicit rent floor check before CPI transfer.
+
 
 ## Instructions for Kuro (Autonomous Solver):
 1. Use skills: `systematic-debugging` and `code-review-and-quality`.
